@@ -12,8 +12,8 @@ and the directory you want the keystore file to be created.
 $ ./generate_unifi_keystore.sh /etc/letsencrypt/live/host.domain.tld/ /var/lib/unifi/
 Success: Generated new UniFi Controller keystore.
 $ ls /var/lib/unifi
-backup	db  firmware.json  keystore  keystore.bck  model_lifecycles.json  sites  system.properties  system.properties.bk
-$
+backup	db  firmware.json  keystore  keystore.bck  model_lifecycles.json  sites
+system.properties system.properties.bk
 ```
 Any existing keystore file will be renamed to keystore.bck. Existing keystore.bck files are deleted.
 
@@ -23,7 +23,6 @@ $ ./generate_unifi_keystore.sh /etc/letsencrypt/live/host.domain.tld/
 Success: Generated new UniFi Controller keystore.
 $ ls -l keystore
 -rw-r--r-- 1  user  user  5245  Feb 22 12:21 keystore
-$
 ```
 
 When running from the command line, the script will NOT set ownership or permissions of the keystore file, and
