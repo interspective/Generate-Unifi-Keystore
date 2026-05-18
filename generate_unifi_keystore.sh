@@ -15,164 +15,171 @@
 
 # When run from cron, all output is directed to syslog.
 
-if [[ -t 1 ]]; then 
+set -euo pipefail
 
-usage() { 
-	printf "\nUsage: $0 /etc/letsencrypt/live/host.domain.tld/ [ /var/lib/unifi/ ]
-	
-			The letsencrypt directory needs to contain both cert.pem
-			and priv-fullchain-bundle.pem files.
+usage() {
+cat <<EOF
 
-			The keystore file will be written to the current working
-			directory if 'outdir' is not specified.
+Usage:
+  $0 /etc/letsencrypt/live/domain/ [ /var/lib/unifi/ ]
 
-			An existing keystore file will be moved to keystore.bck\n"
-} 
+Requirements in LE directory:
+  cert.pem
+  fullchain.pem
+  privkey.pem
 
-if [[ -n "$1" ]]; then letsencrypt_cert_dir="$1"; else usage; exit 0; fi
-if [[ -n "$2" ]]; then unifi_keystore_dir="$2"; else unifi_keystore_dir="$PWD"; fi
+EOF
+}
 
+# Detect interactive mode
+if [[ -t 1 ]]; then
+    [[ $# -lt 1 ]] && { usage; exit 1; }
+
+    letsencrypt_cert_dir="$1"
+    unifi_keystore_dir="${2:-$PWD}"
 else
 
-#-----------------------------------------------------------------------------------#
-#					CRON					    #
-#-----------------------------------------------------------------------------------#
+# -------------------------------------------------------------------
+# CRON CONFIG
+# -------------------------------------------------------------------
 
-# Location of letsencrypt certs and the UniFi Controller keystore.
-# Test on the command line first, and then add your paths in here.
-letsencrypt_cert_dir=/etc/letsencrypt/live/host.domain.tld/
-unifi_keystore_dir=/var/lib/unifi/
+letsencrypt_cert_dir="/etc/letsencrypt/live/host.domain.tld"
+unifi_keystore_dir="/var/lib/unifi"
 
-# Keystore owner and permissions.
-USER=user
-MODE=640
+OWNER="unifi"
+MODE="640"
 
-# Command to restart UniFi Controller.
 restart_uc="docker restart unifi-controller"
-# restart_uc="service unifi restart"
+# restart_uc="systemctl restart unifi"
 
-#-----------------------------------------------------------------------------------#
-#					CRON					    #
-#-----------------------------------------------------------------------------------#
+# -------------------------------------------------------------------
 
-# Output messages to system log if run from cron.
-exec 1> >(logger -s -t $(basename $0)) 2>&1
-
+exec 1> >(logger -s -t "$(basename "$0")") 2>&1
 fi
 
-# The default UniFi Controller keystore password.
-keystore_pass=aircontrolenterprise
+keystore_pass="aircontrolenterprise"
 
-# Check requirements.
-command -v keytool >/dev/null 2>&1 || { printf >&2 "Error: I require Keytool, but it's not installed.\n"; exit 1; }
-command -v openssl >/dev/null 2>&1 || { printf >&2 "Error: I require OpenSSL, but it's not installed.\n"; exit 1; }
+# Requirements
+command -v keytool >/dev/null 2>&1 || {
+    echo "Error: keytool not installed"
+    exit 1
+}
+
+command -v openssl >/dev/null 2>&1 || {
+    echo "Error: openssl not installed"
+    exit 1
+}
+
+# Validate LE files
+for f in cert.pem fullchain.pem privkey.pem; do
+    [[ -f "$letsencrypt_cert_dir/$f" ]] || {
+        echo "Error: Missing $f in $letsencrypt_cert_dir"
+        exit 1
+    }
+done
 
 get_letsencrypt_cert_print() {
-	local retval=$(openssl x509 \
-	-in $letsencrypt_cert_dir/cert.pem \
-	-noout \
-	-sha256 \
-	-fingerprint \
-	| cut -d"=" -f2)
-	echo "$retval"
+    openssl x509 \
+        -in "$letsencrypt_cert_dir/cert.pem" \
+        -noout \
+        -fingerprint \
+        -sha256 \
+    | cut -d= -f2
 }
 
 get_keystore_cert_print() {
-	local retval=$(keytool \
-	-list \
-	-keystore $unifi_keystore_dir/keystore \
-	-alias unifi \
-	-storepass $keystore_pass 2> /dev/null \
-	| grep fingerprint | cut -d" " -f4)
-	echo "$retval"
-}
+    [[ -f "$unifi_keystore_dir/keystore" ]] || return 1
 
-generate_keystore() {
-	tmpfile=$(mktemp -t uc-XXXXXXXXXX) || exit 1 
-	openssl pkcs12 \
-	-export \
-	-out $tmpfile \
-	-in $letsencrypt_cert_dir/priv-fullchain-bundle.pem \
-	-password pass:$keystore_pass \
-	&& \
-	chmod 600 $tmpfile \
-	&& \
-	keytool \
-	-importkeystore \
-	-srckeystore $tmpfile \
-	-srcstoretype pkcs12 \
-	-srcalias 1 \
-	-srcstorepass $keystore_pass \
-	-destkeystore $unifi_keystore_dir/keystore \
-	-deststoretype jks \
-	-destalias unifi \
-	-deststorepass $keystore_pass 2> /dev/null \
-	&& \
-	rm -f $tmpfile \
-	&& \
-	printf "Success: Generated new UniFi Controller keystore.\n" 
+    keytool \
+        -list \
+        -v \
+        -keystore "$unifi_keystore_dir/keystore" \
+        -alias unifi \
+        -storepass "$keystore_pass" 2>/dev/null \
+    | awk -F': ' '/SHA256:/ {print $2; exit}'
 }
 
 compare_certs() {
-	# This compares the certificate's fingerprints to determine if a new keystore
-        # needs to be generated.
-	if [[ "$(get_letsencrypt_cert_print)" == "$(get_keystore_cert_print)" ]]; then
-		# Keystore certificate is current. Nothing to do.
-		return 0
-	else
-		# Keystore certificate is outdated. Update.
-		return 1
-	fi
+    local le_fp ks_fp
+
+    le_fp="$(get_letsencrypt_cert_print)"
+    ks_fp="$(get_keystore_cert_print || true)"
+
+    [[ "$le_fp" == "$ks_fp" ]]
 }
 
-# It all begins, at the end.
-if [[ ! -f $letsencrypt_cert_dir/cert.pem ]] || [[ ! -f $letsencrypt_cert_dir/priv-fullchain-bundle.pem ]]; then
-	printf >&2 "Error: '$letsencrypt_cert_dir' doesn't contain cert.pem or priv-fullchain-bundle.pem\n" 
-	if [[ -t 1 ]]; then
-		usage
-	fi
-exit 1
-fi
+generate_keystore() {
+    local tmpfile
 
-# Compare the certificate fingerprints to see if anything needs to happen.
+    tmpfile="$(mktemp)"
+    trap 'rm -f "$tmpfile"' EXIT
+
+    echo "Generating PKCS12 bundle..."
+
+    openssl pkcs12 \
+        -export \
+        -inkey "$letsencrypt_cert_dir/privkey.pem" \
+        -in "$letsencrypt_cert_dir/cert.pem" \
+        -certfile "$letsencrypt_cert_dir/fullchain.pem" \
+        -name unifi \
+        -out "$tmpfile" \
+        -password "pass:$keystore_pass"
+
+    chmod 600 "$tmpfile"
+
+    echo "Importing into Java keystore..."
+
+    keytool \
+        -importkeystore \
+        -deststorepass "$keystore_pass" \
+        -destkeypass "$keystore_pass" \
+        -destkeystore "$unifi_keystore_dir/keystore" \
+        -srckeystore "$tmpfile" \
+        -srcstoretype PKCS12 \
+        -srcstorepass "$keystore_pass" \
+        -alias unifi \
+        -noprompt
+
+    echo "Success: Generated new UniFi keystore"
+}
+
+# Compare existing cert
 if compare_certs; then
-	# UniFi Controller keystore is current.
-	if [[ -t 1 ]]; then
-		printf "Nothing to do. Keystore contains current certificate.\n" 
-	fi
+    [[ -t 1 ]] && echo "Nothing to do. Keystore already current."
+    exit 0
+fi
+
+# Validate output dir
+[[ -d "$unifi_keystore_dir" ]] || {
+    echo "Error: '$unifi_keystore_dir' is not a directory"
+    exit 1
+}
+
+[[ -w "$unifi_keystore_dir" ]] || {
+    echo "Error: '$unifi_keystore_dir' is not writable"
+    exit 1
+}
+
+# Backup existing keystore
+if [[ -f "$unifi_keystore_dir/keystore" ]]; then
+    rm -f "$unifi_keystore_dir/keystore.bck"
+    mv "$unifi_keystore_dir/keystore" \
+       "$unifi_keystore_dir/keystore.bck"
+fi
+
+generate_keystore
+
+# Cron mode actions
+if [[ ! -t 1 ]]; then
+    chown "$OWNER:$OWNER" "$unifi_keystore_dir/keystore"
+    chmod "$MODE" "$unifi_keystore_dir/keystore"
+
+    if eval "$restart_uc" >/dev/null 2>&1; then
+        echo "Success: UniFi Controller restarted"
+    else
+        echo "Error: Failed to restart UniFi Controller"
+        exit 1
+    fi
+fi
+
 exit 0
-fi
-
-# Check the user hasn't given us a bum steer.
-if [[ ! -d $unifi_keystore_dir ]]; then 
-	printf >&2 "Error: '$unifi_keystore_dir' needs to be a writeable directory.\n" 
-	if [[ -t 1 ]]; then
-		usage
-	fi
-exit 1
-fi
-
-# Backup any existing keystore file.
-if [[ -f $unifi_keystore_dir/keystore ]]; then
-	rm $unifi_keystore_dir/keystore.bck 2>/dev/null
-	mv $unifi_keystore_dir/keystore $unifi_keystore_dir/keystore.bck
-fi
-
-# Generate a new UniFi Controller keystore & restart UC.
-if generate_keystore; then
-	if [[ -t 1 ]]; then
-		exit 0
-	else
-		# Set permissions.
-		chown $USER.$USER $unifi_keystore_dir/keystore
-		chmod $MODE $unifi_keystore_dir/keystore
-		# Restart UniFi Controller service.
-		command $restart_uc >/dev/null 2>&1 && printf "Success: UniFi Controller service restarted.\n" \
-		|| { printf >&2 "Error: Could not restart UniFi Controller.\n"; exit 1; }
-		exit 0
-	fi
-fi
-
-# We shouldn't get to here... but we'll handle it if we do.
-printf >&2 "Error: Couldn't generate UniFi Controller keystore file.\n"
-exit 1
